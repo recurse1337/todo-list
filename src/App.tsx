@@ -1,21 +1,274 @@
-import React from 'react';
-import './App.scss';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import * as todoService from './api/todos';
+import { Todo } from './types/Todo';
+import { Filter } from './types/Filter';
+import { TodoList } from './components/TodoList';
+import { Footer } from './components/Footer';
+import { ErrorNotification } from './components/ErrorNotification';
+import { TodoItem } from './components/TodoItem';
+import { Header } from './components/Header';
 
-interface Props {
-  onClick: () => void;
-  children: React.ReactNode;
+function getVisibleTodos(todos: Todo[], selectedFilter: Filter) {
+  if (selectedFilter === Filter.All) {
+    return todos;
+  }
+
+  return todos.filter(
+    todo => todo.completed === (selectedFilter === Filter.Completed),
+  );
 }
 
-export const Provider: React.FC<Props> = React.memo(({ onClick, children }) => (
-  <button type="button" onClick={onClick}>
-    {children}
-  </button>
-));
-
 export const App: React.FC = () => {
+  const [todos, setTodos] = useState<Todo[]>([]);
+  const [selectedFilter, setSelectedFilter] = useState<Filter>(Filter.All);
+  const [errorMessage, setErrorMessage] = useState<string>('');
+  const [tempTodo, setTempTodo] = useState<Todo | null>(null);
+  const [title, setTitle] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [isAddingTodo, setIsAddingTodo] = useState(false);
+  const [processingTodoIds, setProcessingTodoIds] = useState<number[]>([]);
+
+  const visibleTodos = useMemo(
+    () => getVisibleTodos(todos, selectedFilter),
+    [todos, selectedFilter],
+  );
+
+  const editInput = useRef<HTMLInputElement>(null);
+  const errorTimerId = useRef<ReturnType<typeof setTimeout>>();
+
+  const showError = (message: string) => {
+    setErrorMessage(message);
+
+    if (errorTimerId.current) {
+      clearTimeout(errorTimerId.current);
+    }
+
+    errorTimerId.current = setTimeout(() => {
+      setErrorMessage('');
+    }, 3000);
+  };
+
+  useEffect(() => {
+    setErrorMessage('');
+
+    todoService
+      .getTodos()
+      .then(setTodos)
+      .catch(() => {
+        showError('Unable to load todos');
+      })
+      .finally(() => setIsLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (!isAddingTodo) {
+      editInput.current?.focus();
+    }
+  }, [isAddingTodo]);
+
+  const handleSubmit = (event: React.FormEvent) => {
+    event.preventDefault();
+
+    const normalizedTitle = title.trim();
+
+    if (normalizedTitle === '') {
+      showError('Title should not be empty');
+
+      return;
+    }
+
+    const todoToAdd = {
+      id: 0,
+      userId: todoService.USER_ID,
+      title: normalizedTitle,
+      completed: false,
+    };
+
+    setTempTodo(todoToAdd);
+    setIsAddingTodo(true);
+
+    todoService
+      .createTodo(normalizedTitle)
+      .then(newTodo => {
+        setTodos(prevTodos => [...prevTodos, newTodo]);
+        setTitle('');
+      })
+      .catch(() => showError('Unable to add a todo'))
+      .finally(() => {
+        setTempTodo(null);
+        setIsAddingTodo(false);
+      });
+  };
+
+  const handleDelete = (todo: Todo) => {
+    setProcessingTodoIds(prevIds => [...prevIds, todo.id]);
+
+    todoService
+      .deleteTodo(todo.id)
+      .then(() =>
+        setTodos(prevTodos => prevTodos.filter(({ id }) => id !== todo.id)),
+      )
+      .catch(() => showError('Unable to delete a todo'))
+      .finally(() => {
+        setProcessingTodoIds(prevIds => prevIds.filter(id => id !== todo.id));
+
+        editInput.current?.focus();
+      });
+  };
+
+  const handleClearCompleted = () => {
+    const completedTodos = todos.filter(({ completed }) => completed);
+    const completedTodoIds = completedTodos.map(({ id }) => id);
+
+    setProcessingTodoIds(prevIds => [...prevIds, ...completedTodoIds]);
+
+    const deletedRequests = completedTodos.map(({ id }) =>
+      todoService.deleteTodo(id),
+    );
+
+    Promise.allSettled(deletedRequests).then(results => {
+      const successfullyDeletedTodos: Todo[] = [];
+
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          successfullyDeletedTodos.push(completedTodos[index]);
+        }
+      });
+
+      const successfullyDeletedIds = successfullyDeletedTodos.map(
+        ({ id }) => id,
+      );
+
+      setTodos(prevTodos =>
+        prevTodos.filter(todo => !successfullyDeletedIds.includes(todo.id)),
+      );
+
+      setProcessingTodoIds(prevIds =>
+        prevIds.filter(id => !completedTodoIds.includes(id)),
+      );
+
+      if (results.some(result => result.status === 'rejected')) {
+        showError('Unable to delete a todo');
+      }
+
+      editInput.current?.focus();
+    });
+  };
+
+  const handleToggleTodo = (todoToUpdate: Todo) => {
+    setProcessingTodoIds(prevIds => [...prevIds, todoToUpdate.id]);
+
+    return todoService
+      .updateTodo({
+        ...todoToUpdate,
+        completed: !todoToUpdate.completed,
+      })
+      .then(updatedTodo => {
+        setTodos(prevTodos =>
+          prevTodos.map(todo =>
+            todo.id === updatedTodo.id ? updatedTodo : todo,
+          ),
+        );
+      })
+      .catch(() => showError('Unable to update a todo'))
+      .finally(() =>
+        setProcessingTodoIds(prevTodoIds =>
+          prevTodoIds.filter(id => id !== todoToUpdate.id),
+        ),
+      );
+  };
+
+  const handleRenameTodo = (todoToUpdate: Todo, newTitle: string) => {
+    setProcessingTodoIds(prevIds => [...prevIds, todoToUpdate.id]);
+
+    return todoService
+      .updateTodo({
+        ...todoToUpdate,
+        title: newTitle,
+      })
+      .then(updatedTodo => {
+        setTodos(prevTodos =>
+          prevTodos.map(todo =>
+            todo.id === updatedTodo.id ? updatedTodo : todo,
+          ),
+        );
+      })
+      .catch(() => {
+        showError('Unable to update a todo');
+        throw new Error();
+      })
+      .finally(() => {
+        setProcessingTodoIds(prevIds =>
+          prevIds.filter(id => id !== todoToUpdate.id),
+        );
+      });
+  };
+
+  const handleToggleAll = () => {
+    const areAllCompleted = todos.every(({ completed }) => completed);
+
+    return Promise.allSettled(
+      todos
+        .filter(({ completed }) => completed === areAllCompleted)
+        .map(handleToggleTodo),
+    );
+  };
+
+  const completedTodosCount = useMemo(
+    () => todos.filter(({ completed }) => completed).length,
+    [todos],
+  );
+
+  const activeTodosCount = todos.length - completedTodosCount;
+
   return (
-    <div className="starter">
-      <Provider onClick={() => ({})}>TodoList</Provider>
+    <div className="todoapp">
+      <h1 className="todoapp__title">todos</h1>
+
+      <div className="todoapp__content">
+        <Header
+          todosLength={todos.length}
+          completedTodosCount={completedTodosCount}
+          title={title}
+          onTitleChange={setTitle}
+          onSubmit={handleSubmit}
+          editInput={editInput}
+          isLoading={isLoading}
+          isAddingTodo={isAddingTodo}
+          onToggleAll={handleToggleAll}
+        />
+
+        {(todos.length > 0 || tempTodo !== null) && (
+          <>
+            <TodoList
+              todos={visibleTodos}
+              processingTodoIds={processingTodoIds}
+              onDelete={handleDelete}
+              onToggle={handleToggleTodo}
+              onRename={handleRenameTodo}
+            />
+
+            {tempTodo !== null && (
+              <TodoItem todo={tempTodo} isLoading={isAddingTodo} />
+            )}
+
+            {todos.length > 0 && (
+              <Footer
+                activeTodosCount={activeTodosCount}
+                completedTodosCount={completedTodosCount}
+                selectedFilter={selectedFilter}
+                onFilterChange={setSelectedFilter}
+                onClearCompleted={handleClearCompleted}
+              />
+            )}
+          </>
+        )}
+      </div>
+
+      <ErrorNotification
+        errorMessage={errorMessage}
+        onClose={() => setErrorMessage('')}
+      />
     </div>
   );
 };
